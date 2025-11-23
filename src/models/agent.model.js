@@ -36,6 +36,44 @@ const Agent = sequelize.define('Agent', {
             notEmpty: true
         }
     },
+    gender: {
+        type: DataTypes.ENUM('male', 'female', 'other', 'prefer_not_to_say'),
+        allowNull: true,
+        defaultValue: null,
+        field: 'gender',
+        comment: 'Agent gender'
+    },
+    // Email verification
+    emailVerified: {
+        type: DataTypes.BOOLEAN,
+        allowNull: false,
+        defaultValue: false,
+        field: 'email_verified'
+    },
+    emailVerifiedAt: {
+        type: DataTypes.DATE,
+        allowNull: true,
+        defaultValue: null,
+        field: 'email_verified_at'
+    },
+    emailVerificationToken: {
+        type: DataTypes.STRING(128),
+        allowNull: true,
+        defaultValue: null,
+        field: 'email_verification_token'
+    },
+    emailVerificationSentAt: {
+        type: DataTypes.DATE,
+        allowNull: true,
+        defaultValue: null,
+        field: 'email_verification_sent_at'
+    },
+    emailVerificationAttempts: {
+        type: DataTypes.INTEGER,
+        allowNull: false,
+        defaultValue: 0,
+        field: 'email_verification_attempts'
+    },
     password: {
         type: DataTypes.STRING(255),
         allowNull: false,
@@ -202,11 +240,24 @@ const Agent = sequelize.define('Agent', {
         allowNull: true,
         defaultValue: null
     },
+    dob: {
+        type: DataTypes.DATEONLY,
+        allowNull: true,
+        defaultValue: null,
+        field: 'dob',
+        comment: 'Date of birth'
+    },
     documents: {
         type: DataTypes.JSON,
         allowNull: true,
         defaultValue: null,
         comment: 'Store uploaded document references'
+    },
+    vehicle: {
+        type: DataTypes.JSON,
+        allowNull: true,
+        defaultValue: null,
+        comment: 'Vehicle details provided by the agent'
     },
     emergencyContactName: {
         type: DataTypes.STRING(100),
@@ -219,6 +270,49 @@ const Agent = sequelize.define('Agent', {
         allowNull: true,
         defaultValue: null,
         field: 'emergency_contact_phone'
+    },
+    // Phone verification
+    phoneVerified: {
+        type: DataTypes.BOOLEAN,
+        allowNull: false,
+        defaultValue: false,
+        field: 'phone_verified'
+    },
+    phoneVerifiedAt: {
+        type: DataTypes.DATE,
+        allowNull: true,
+        defaultValue: null,
+        field: 'phone_verified_at'
+    },
+    phoneVerificationCode: {
+        type: DataTypes.STRING(128),
+        allowNull: true,
+        defaultValue: null,
+        field: 'phone_verification_code'
+    },
+    phoneVerificationExpiresAt: {
+        type: DataTypes.DATE,
+        allowNull: true,
+        defaultValue: null,
+        field: 'phone_verification_expires_at'
+    },
+    phoneVerificationSentAt: {
+        type: DataTypes.DATE,
+        allowNull: true,
+        defaultValue: null,
+        field: 'phone_verification_sent_at'
+    },
+    phoneVerificationAttempts: {
+        type: DataTypes.INTEGER,
+        allowNull: false,
+        defaultValue: 0,
+        field: 'phone_verification_attempts'
+    },
+    phoneVerificationMethod: {
+        type: DataTypes.ENUM('sms', 'voice'),
+        allowNull: false,
+        defaultValue: 'sms',
+        field: 'phone_verification_method'
     },
 
     // Timestamps

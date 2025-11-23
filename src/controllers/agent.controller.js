@@ -12,6 +12,11 @@ import { HTTP_STATUS, GENERAL_MESSAGES, AGENT_MESSAGES } from '../constants.js';
 import Agent from '../models/agent.model.js';
 import { generateTokens, getTokenExpiry } from '../utils/jwtUtils.js';
 import tokenBlacklist from '../utils/tokenBlacklist.js';
+import crypto from 'crypto';
+import { sendVerificationEmail, sendWelcomeEmail, generateOTP } from '../utils/emailService.js';
+import { sendOTPMessage } from '../utils/messageService.js';
+import { processAndSaveImage } from '../utils/uploadImage.js';
+import AgentCategory from '../models/agentCategory.model.js';
 
 // @desc    Register a new agent
 // @route   POST /api/agents/register
@@ -103,6 +108,10 @@ const registerAgent = asyncHandler(async (req, res) => {
     }
 
     // Create agent in database
+    // generate secure verification token for email
+    const verificationToken = crypto.randomBytes(32).toString('hex');
+    const now = new Date();
+
     const newAgent = await Agent.create({
         name,
         email,
@@ -122,9 +131,21 @@ const registerAgent = asyncHandler(async (req, res) => {
         verificationStatus: 'pending',
         availabilityStatus: 'offline',
         isActive: true,
-        backgroundCheckStatus: 'pending'
+        backgroundCheckStatus: 'pending',
+        // Email verification fields
+        emailVerified: false,
+        emailVerificationToken: verificationToken,
+        emailVerificationSentAt: now,
+        emailVerificationAttempts: 0
     });
-
+    // Send verification email (do not block registration on email failure)
+    try {
+        await sendVerificationEmail(newAgent.email, newAgent.name, verificationToken);
+        console.log(`Verification email sent to ${newAgent.email}`);
+    } catch (err) {
+        console.error('Failed to send verification email for agent:', newAgent.email, err);
+    }
+    
     // Remove sensitive data from response
     const agentData = {
         agentId: newAgent.agentId,
@@ -138,7 +159,6 @@ const registerAgent = asyncHandler(async (req, res) => {
         hourlyRate: newAgent.hourlyRate,
         verificationStatus: newAgent.verificationStatus,
         availabilityStatus: newAgent.availabilityStatus,
-        createdAt: newAgent.createdAt
     };
 
     return sendCreated(
@@ -180,12 +200,12 @@ const loginAgent = asyncHandler(async (req, res) => {
     }
 
     // Check verification status
-    if (agent.verificationStatus === 'pending') {
-        throw new ApiError(
-            HTTP_STATUS.UNAUTHORIZED,
-            AGENT_MESSAGES.ACCOUNT_PENDING
-        );
-    }
+    // if (agent.verificationStatus === 'pending') {
+    //     throw new ApiError(
+    //         HTTP_STATUS.UNAUTHORIZED,
+    //         AGENT_MESSAGES.ACCOUNT_PENDING
+    //     );
+    // }
 
     if (agent.verificationStatus === 'rejected') {
         throw new ApiError(
@@ -204,7 +224,7 @@ const loginAgent = asyncHandler(async (req, res) => {
     }
 
     // Update last active time
-    await agent.update({ lastActiveAt: new Date() });
+    await agent.update({ availabilityStatus: 'available', lastActiveAt: new Date() });
 
     // Generate JWT tokens
     const payload = {
@@ -629,8 +649,8 @@ const getAllAgents = asyncHandler(async (req, res) => {
 
     // Build where clause
     let whereClause = {
-        verificationStatus: 'verified',
-        isActive: true
+        // verificationStatus: 'verified',
+        // isActive: true
     };
 
     if (city) whereClause.city = city;
@@ -678,8 +698,8 @@ const getAllAgents = asyncHandler(async (req, res) => {
 // @access  Public
 const getAgentById = asyncHandler(async (req, res) => {
     const { id } = req.params;
-
     const agent = await Agent.findByPk(id);
+
     if (!agent) {
         throw new ApiError(
             HTTP_STATUS.NOT_FOUND,
@@ -687,8 +707,8 @@ const getAgentById = asyncHandler(async (req, res) => {
         );
     }
 
-    // Only return if verified and active
-    if (!agent.isVerified() || !agent.isActiveAgent()) {
+    // Only return if verified and active !agent.isVerified() ||
+    if (!agent.isActiveAgent()) {
         throw new ApiError(
             HTTP_STATUS.NOT_FOUND,
             AGENT_MESSAGES.NOT_FOUND
@@ -702,6 +722,286 @@ const getAgentById = asyncHandler(async (req, res) => {
     );
 });
 
+// Email verification handler (public)
+const verifyEmail = asyncHandler(async (req, res) => {
+    const token = req.query.token || req.body.token;
+
+    if (!token) {
+        throw new ApiError(HTTP_STATUS.BAD_REQUEST, 'Verification token is required');
+    }
+
+    // Find agent by token
+    const agent = await Agent.findOne({ where: { emailVerificationToken: token } });
+    if (!agent) {
+        throw new ApiError(HTTP_STATUS.NOT_FOUND, 'Invalid or expired verification token');
+    }
+
+    // Check expiry (10 minutes)
+    const sentAt = agent.emailVerificationSentAt;
+    if (!sentAt) {
+        throw new ApiError(HTTP_STATUS.BAD_REQUEST, 'Invalid verification token');
+    }
+
+    const now = new Date();
+    const diffMs = now - new Date(sentAt);
+    const diffMinutes = diffMs / (1000 * 60);
+    if (diffMinutes > 10) {
+        // expire token
+        await agent.update({ emailVerificationToken: null, emailVerificationSentAt: null, emailVerificationAttempts: agent.emailVerificationAttempts + 1 });
+        throw new ApiError(HTTP_STATUS.BAD_REQUEST, 'Verification token has expired');
+    }
+
+    // Mark email verified, clear token and set timestamp
+    await agent.update({
+        emailVerified: true,
+        emailVerifiedAt: now,
+        emailVerificationToken: null,
+        emailVerificationSentAt: null
+    });
+
+    // Send welcome email (best-effort)
+    try {
+        await sendWelcomeEmail(agent.email, agent.name);
+    } catch (err) {
+        console.error('Failed to send welcome email:', err);
+    }
+
+    return sendSuccess(res, 'Email verified successfully', { email: agent.email });
+});
+
+// Resend verification email (public)
+const resendVerificationEmail = asyncHandler(async (req, res) => {
+    const { email } = req.body;
+
+    if (!email) {
+        throw new ApiError(HTTP_STATUS.BAD_REQUEST, 'Email is required');
+    }
+
+    // Find agent by email
+    const agent = await Agent.findByEmail(email);
+    if (!agent) {
+        throw new ApiError(HTTP_STATUS.NOT_FOUND, AGENT_MESSAGES.NOT_FOUND);
+    }
+    console.log('Found agent for resend verification:', agent);
+
+    // If already verified
+    if (agent.emailVerified === true || agent.verificationStatus === 'verified') {
+        return sendBadRequest(res, 'Email already verified');
+    }
+
+    // Optional: rate-limit by attempts (simple example)
+    const maxAttempts = process.env.EMAIL_VERIFICATION_ATTEMPTS || 10;
+    if (agent.emailVerificationAttempts >= maxAttempts) {
+        throw new ApiError(HTTP_STATUS.TOO_MANY_REQUESTS, 'Too many verification attempts. Please contact support');
+    }
+
+    // Generate new token and update record
+    const verificationToken = crypto.randomBytes(32).toString('hex');
+    const now = new Date();
+
+    await agent.update({
+        emailVerificationToken: verificationToken,
+        emailVerificationSentAt: now,
+        emailVerificationAttempts: agent.emailVerificationAttempts + 1
+    });
+
+    // Send verification email (best-effort)
+    try {
+        await sendVerificationEmail(agent.email, agent.name || agent.email, verificationToken);
+    } catch (err) {
+        console.error('Failed to resend verification email for agent:', agent.email, err);
+        // Don't fail the request if email sending fails - return success but inform client to try later
+        return sendSuccess(res, 'Verification email queued (sending failed, try again later)', { email: agent.email });
+    }
+
+    return sendSuccess(res, 'Verification email sent', { email: agent.email });
+});
+
+// Send phone OTP (public)
+const sendPhoneOTP = asyncHandler(async (req, res) => {
+    const { phone } = req.body;
+
+    if (!phone) {
+        throw new ApiError(HTTP_STATUS.BAD_REQUEST, 'Phone number is required');
+    }
+
+    const agent = await Agent.findByPhone(phone);
+    if (!agent) {
+        throw new ApiError(HTTP_STATUS.NOT_FOUND, AGENT_MESSAGES.NOT_FOUND);
+    }
+
+    if (agent.phoneVerified === true) {
+        return sendBadRequest(res, 'Phone already verified');
+    }
+
+    const maxAttempts = process.env.PHONE_VERIFICATION_ATTEMPTS || 10;
+    if (agent.phoneVerificationAttempts >= maxAttempts) {
+        throw new ApiError(HTTP_STATUS.TOO_MANY_REQUESTS, 'Too many verification attempts. Please contact support');
+    }
+
+    const otp = generateOTP();
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + 10 * 60 * 1000); // 10 minutes
+
+    await agent.update({
+        phoneVerificationCode: String(otp),
+        phoneVerificationExpiresAt: expiresAt,
+        phoneVerificationSentAt: now,
+        phoneVerificationAttempts: agent.phoneVerificationAttempts + 1
+    });
+
+    try {
+        await sendOTPMessage(agent.phone, agent.name || agent.email, otp);
+    } catch (err) {
+        console.error('Failed to send phone OTP:', err);
+        return sendSuccess(res, 'OTP queued (sending failed, try again later)', { phone: agent.phone });
+    }
+
+    return sendSuccess(res, 'OTP sent', { phone: agent.phone });
+});
+
+// Verify phone OTP (public)
+const verifyPhone = asyncHandler(async (req, res) => {
+    const { phone, code } = req.body;
+
+    if (!phone || !code) {
+        throw new ApiError(HTTP_STATUS.BAD_REQUEST, 'Phone and code are required');
+    }
+
+    const agent = await Agent.findByPhone(phone);
+    if (!agent) {
+        throw new ApiError(HTTP_STATUS.NOT_FOUND, AGENT_MESSAGES.NOT_FOUND);
+    }
+
+    if (!agent.phoneVerificationCode) {
+        throw new ApiError(HTTP_STATUS.BAD_REQUEST, 'No verification code found. Request a new code');
+    }
+
+    const now = new Date();
+    if (agent.phoneVerificationExpiresAt && new Date(agent.phoneVerificationExpiresAt) < now) {
+        // expire
+        await agent.update({ phoneVerificationCode: null, phoneVerificationExpiresAt: null });
+        throw new ApiError(HTTP_STATUS.BAD_REQUEST, 'Verification code has expired');
+    }
+
+    if (String(code) !== String(agent.phoneVerificationCode)) {
+        await agent.update({ phoneVerificationAttempts: agent.phoneVerificationAttempts + 1 });
+        throw new ApiError(HTTP_STATUS.BAD_REQUEST, 'Invalid verification code');
+    }
+
+    // Verified
+    await agent.update({
+        phoneVerified: true,
+        phoneVerifiedAt: now,
+        phoneVerificationCode: null,
+        phoneVerificationExpiresAt: null
+    });
+
+    return sendSuccess(res, 'Phone verified successfully', { phone: agent.phone });
+});
+
+// @desc    Setup agent profile (upload pictures/documents, address, categories, vehicle, dob)
+// @route   POST /api/agents/setup-profile
+// @access  Private (Agent)
+const setupProfile = asyncHandler(async (req, res) => {
+    const agentId = req.user?.id;
+
+    if (!agentId) {
+        throw new ApiError(
+            HTTP_STATUS.UNAUTHORIZED,
+            'Agent not authenticated'
+        );
+    }
+
+    const agent = await Agent.findByPk(agentId);
+    if (!agent) {
+        throw new ApiError(HTTP_STATUS.NOT_FOUND, AGENT_MESSAGES.NOT_FOUND);
+    }
+
+    // Process uploaded files (multer memory storage) and persist via processAndSaveImage
+    let profilePicturePath = agent.profilePicture || null;
+    if (req.files && req.files.profilePicture && req.files.profilePicture.length > 0) {
+        const file = req.files.profilePicture[0];
+        const result = await processAndSaveImage(file.buffer, file.originalname, 'agents/profile');
+        profilePicturePath = result.path.replace(/\\/g, '/');
+    }
+
+    // Documents
+    const existingDocs = Array.isArray(agent.documents) ? agent.documents : (agent.documents ? [agent.documents] : []);
+    const newDocs = [];
+    if (req.files && req.files.documents && req.files.documents.length > 0) {
+        for (const file of req.files.documents) {
+            const r = await processAndSaveImage(file.buffer, file.originalname, 'agents/documents');
+            newDocs.push({ originalName: r.originalName, path: r.path.replace(/\\/g, '/'), size: r.size, uploadedAt: new Date() });
+        }
+    }
+
+    // Parse and validate other profile fields
+    const {
+        baseAddress,
+        city,
+        state,
+        zipcode,
+        country,
+        latitude,
+        longitude,
+        emergencyContactName,
+        emergencyContactPhone,
+        dob,
+        categories,
+        vehicle
+    } = req.body;
+
+    const updateData = {};
+    if (profilePicturePath) updateData.profilePicture = profilePicturePath;
+    if (newDocs.length > 0) updateData.documents = existingDocs.concat(newDocs);
+    if (baseAddress !== undefined) updateData.baseAddress = baseAddress;
+    if (city !== undefined) updateData.city = city;
+    if (state !== undefined) updateData.state = state;
+    if (zipcode !== undefined) updateData.zipcode = zipcode;
+    if (country !== undefined) updateData.country = country;
+    if (latitude !== undefined) updateData.currentLatitude = latitude;
+    if (longitude !== undefined) updateData.currentLongitude = longitude;
+    if (emergencyContactName !== undefined) updateData.emergencyContactName = emergencyContactName;
+    if (emergencyContactPhone !== undefined) updateData.emergencyContactPhone = emergencyContactPhone;
+    if (dob !== undefined) updateData.dob = dob;
+
+    // vehicle can be sent as JSON string or object
+    if (vehicle !== undefined) {
+        try {
+            updateData.vehicle = typeof vehicle === 'string' ? JSON.parse(vehicle) : vehicle;
+        } catch (err) {
+            throw new ApiError(HTTP_STATUS.BAD_REQUEST, 'Invalid vehicle JSON');
+        }
+    }
+
+    // Persist basic updates
+    await agent.update(updateData);
+
+    // Handle categories (array of category ids). Accept JSON string or array
+    if (categories !== undefined) {
+        let catArray = [];
+        try {
+            catArray = typeof categories === 'string' ? JSON.parse(categories) : categories;
+        } catch (err) {
+            throw new ApiError(HTTP_STATUS.BAD_REQUEST, 'Invalid categories JSON');
+        }
+
+        if (Array.isArray(catArray)) {
+            // Create associations if not present
+            for (const catId of catArray) {
+                await AgentCategory.findOrCreate({ where: { agentId: agent.agentId, categoryId: catId }, defaults: { segment: null } });
+            }
+            // Optionally update agent.specializations to reflect category ids/names
+            await agent.update({ specializations: catArray });
+        } else {
+            throw new ApiError(HTTP_STATUS.BAD_REQUEST, 'Categories must be an array');
+        }
+    }
+
+    return sendSuccess(res, 'Profile setup completed', agent.toJSON());
+});
+
 export {
     registerAgent,
     loginAgent,
@@ -713,5 +1013,10 @@ export {
     addSpecialization,
     removeSpecialization,
     getAllAgents,
-    getAgentById
+    getAgentById,
+    resendVerificationEmail,
+    setupProfile,
+    sendPhoneOTP,
+    verifyPhone,
+    verifyEmail
 };
